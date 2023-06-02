@@ -1,0 +1,139 @@
+generate_cert() {
+  /usr/local/bin/.waffle/logger.sh --level INFO "Issuing SSL certificate for $domain"
+
+  local domain=$1
+  local ssl_cert_type=$2
+
+  case $ssl_cert_type in
+    "self-signed")  /usr/local/bin/.waffle/certbot.sh --self 90 $domain;;
+    "letsencrypt")  /usr/local/bin/.waffle/certbot.sh --certbot $WAFFLE_LETSENCRYPT_EMAIL $WAFFLE_CERTBOT_SERVER $domain;;
+    *)              echo "Invalid cert type."; exit 1;;
+  esac
+
+  if [ $? -ne 0 ]; then
+    /usr/local/bin/.waffle/json.sh "status" "error" "step" "generate_cert" >> "/var/www/html/$domain/.waffle/gen.log"
+    exit 1
+  fi
+
+  /usr/local/bin/.waffle/logger.sh --level INFO "Issued SSL certificate for $domain"
+}
+
+generate_wordpress() {
+  /usr/local/bin/.waffle/logger.sh --level INFO "Creating Wordpress for $domain"
+
+  local domain=$1
+
+  tar -xzf "/etc/waffle/wordpress.tar.gz" --strip-components=1 -C /var/www/html/$domain
+  chown -R www-data: "/var/www/html/$domain"
+  chmod -R 755 "/var/www/html/$domain"
+
+  if [ $? -ne 0 ]; then
+    /usr/local/bin/.waffle/json.sh "status" "error" "step" "generate_wordpress" >> "/var/www/html/$domain/.waffle/gen.log"
+    exit 1
+  fi
+
+  /usr/local/bin/.waffle/logger.sh --level INFO "Created Wordpress for $domain"
+}
+
+host_domain() {
+  /usr/local/bin/.waffle/logger.sh --level INFO "Exposing $domain"
+
+  local domain=$1
+  local protocol=$2
+
+  mkdir -p /etc/nginx/sites-available
+  mkdir -p /etc/nginx/sites-enabled
+
+  cp /etc/waffle/server-$protocol.conf /etc/nginx/sites-available/$domain
+  sed -i "s/server_name _/server_name $domain/g" "/etc/nginx/sites-available/$domain"
+
+  ln -s "/etc/nginx/sites-available/$domain" "/etc/nginx/sites-enabled/$domain"
+
+  if [ $? -ne 0 ]; then
+    /usr/local/bin/.waffle/json.sh "status" "error" "step" "host_domain" >> "/var/www/html/$domain/.waffle/gen.log"
+    exit 1
+  fi
+
+  service nginx restart
+
+  /usr/local/bin/.waffle/logger.sh --level INFO "Exposed $domain"
+}
+
+waffle_check_domain() {
+  /usr/local/bin/.waffle/logger.sh --level INFO "Checking $domain"
+
+  local domain=$1
+
+  if [ ! -f "/var/www/html/$domain/.waffle/gen.log" ]; then
+    mkdir -p "/var/www/html/$domain/.waffle"
+    echo "{ \"status\": \"processing\" }" > "/var/www/html/$domain/.waffle/gen.log"
+    if [ -f "/var/www/html/$domain/waffle-config.json" ]; then
+      type=$(jq -r '.type' "/var/www/html/$domain/waffle-config.json")
+      protocol=$(jq -r '.protocol' "/var/www/html/$domain/waffle-config.json")
+      case $type in
+        "wordpress")  generate_wordpress $domain; host_domain $domain $protocol;;
+        "custom")     host_domain $domain $protocol;;
+        "proxy")      ;;
+        *)            /usr/local/bin/.waffle/logger.sh --level ERROR "Malformed waffle configuration file for $domain";;
+      esac
+      case $protocol in
+        "https")  ssl_cert_type=$(jq -r '.ssl_cert_type' "/var/www/html/$domain/waffle-config.json"); generate_cert $domain $ssl_cert_type;;
+        "http")   ;;
+        *)        /usr/local/bin/.waffle/json.sh "status" "error" "cause" "Invalid protocol" >> "/var/www/html/$domain/.waffle/gen.log"; exit 1;;
+      esac
+      /usr/local/bin/.waffle/json.sh "status" "success" >> "/var/www/html/$domain/.waffle/gen.log"
+    else
+      /usr/local/bin/.waffle/json.sh "status" "error" "cause" "Waffle config not provided" >> "/var/www/html/$domain/.waffle/gen.log"
+      exit 1;
+    fi
+  fi
+
+  /usr/local/bin/.waffle/logger.sh --level INFO "Checked $domain"
+}
+
+check() {
+  for domain in $(ls "/var/www/html")
+  do
+    waffle_check_domain $domain
+  done
+}
+
+init() {
+  if [ ! -f "/var/log/waffle.log" ]; then
+    touch "/var/log/waffle.log"
+    echo "$WAFFLE_CERTS_RENEW_CRON waffle sign --renew" | crontab -
+    echo "$WAFFLE_CHECK_CRON waffle check" | crontab -
+    /usr/local/bin/.waffle/logger.sh --level INFO "Crontab set"
+  else
+    echo "Waffle already inited"
+  fi
+
+  service cron start
+  service php8.1-fpm start
+  service nginx start
+
+  tail -f /dev/null
+}
+
+usage() {
+  echo "Usage: waffle <ACTION> [OPTIONS]"
+  echo ""
+  echo "  ACTIONS:"
+  echo "    init:                 Initiates waffle"
+  echo "    check:                Check for new domains"
+  echo "    sign:                 Check for new domains"
+  echo "    json [key value ...]: Generates a json"
+  echo "    log:                  Writes into /usr/local/bin/.waffle/logger.shfile"
+}
+
+while true; do
+  case "$1" in
+    init)   shift; init $@; exit 0;;
+    check)  shift; check;;
+    sign)   shift; /usr/local/bin/.waffle/certbot.sh $@; exit 0;;
+    json)   shift; /usr/local/bin/.waffle/json.sh $@; exit 0;;
+    log)    shift; /usr/local/bin/.waffle/logger.sh $@; exit 0;;
+    *)      usage; exit 1;;
+    "")     exit 0;;
+  esac
+done
